@@ -28,7 +28,7 @@ jobs:
           set -euxo pipefail
 
           # ── 1. Install Rust via rustup (no marketplace action) ──────────────
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.79.0
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
           source "$HOME/.cargo/env"
           rustc --version
           cargo --version
