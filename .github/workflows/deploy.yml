@@ -1,0 +1,89 @@
+name: Build & Deploy Anchor Program
+
+on:
+  workflow_dispatch:          # Run manually from GitHub UI
+    inputs:
+      network:
+        description: 'Network to deploy to'
+        required: true
+        default: 'devnet'
+        type: choice
+        options:
+          - devnet
+          - mainnet-beta
+
+jobs:
+  build-and-deploy:
+    name: Build & Deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Checkout ─────────────────────────────────────────────────────────
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      # ── 2. Install Rust (pinned to Anchor 0.30.1 compatible version) ────────
+      - name: Install Rust 1.79.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.79.0"
+          components: rustfmt, clippy
+
+      # ── 3. Cache cargo registry ─────────────────────────────────────────────
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # ── 4. Install Solana CLI 1.18.26 ────────────────────────────────────────
+      - name: Install Solana CLI
+        run: |
+          sh -c "$(curl -sSfL https://release.solana.com/v1.18.26/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
+
+      # ── 5. Write deployer keypair from secret ────────────────────────────────
+      - name: Write deployer keypair
+        run: |
+          echo '${{ secrets.DEPLOYER_KEYPAIR }}' > /tmp/deployer.json
+          solana config set --keypair /tmp/deployer.json
+          solana config set --url ${{ inputs.network }}
+          echo "Deployer address: $(solana address)"
+          echo "Balance: $(solana balance)"
+
+      # ── 6. Remove stale lockfile, build ──────────────────────────────────────
+      - name: Build Anchor program
+        run: |
+          rm -f Cargo.lock
+          cargo build-sbf 2>&1
+
+      # ── 7. Deploy to chosen network ──────────────────────────────────────────
+      - name: Deploy to ${{ inputs.network }}
+        run: |
+          PROGRAM_SO="target/deploy/moonflux_curve.so"
+          echo "Deploying $PROGRAM_SO to ${{ inputs.network }}..."
+          solana program deploy "$PROGRAM_SO" \
+            --keypair /tmp/deployer.json \
+            --url ${{ inputs.network }} \
+            --output json 2>&1 | tee /tmp/deploy_output.txt
+          PROGRAM_ID=$(cat /tmp/deploy_output.txt | grep -o '"programId":"[^"]*"' | cut -d'"' -f4)
+          echo "✅ DEPLOYED PROGRAM ID: $PROGRAM_ID"
+          echo "program_id=$PROGRAM_ID" >> $GITHUB_OUTPUT
+
+      # ── 8. Print program ID summary ──────────────────────────────────────────
+      - name: Summary
+        run: |
+          echo "### ✅ Deployment Complete" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Network | ${{ inputs.network }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Binary | target/deploy/moonflux_curve.so |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Copy the Program ID from the Deploy step above and add it to:**" >> $GITHUB_STEP_SUMMARY
+          echo "- \`moonflux-mvp/lib/program.ts\` → \`PROGRAM_ID\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`moonflux-mvp/.env.local\` → \`NEXT_PUBLIC_PROGRAM_ID\`" >> $GITHUB_STEP_SUMMARY
