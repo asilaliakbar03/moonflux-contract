@@ -7,7 +7,7 @@ use anchor_spl::{
     },
 };
 
-declare_id!("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS");
+declare_id!("8vkiPVrCriVX2YPtmEPLh37odLCdEiT49VBgyrXkqKbS");
 
 // ── CONSTANTS ─────────────────────────────────────────────────────────────────
 pub const VIRTUAL_SOL_RESERVE: u64   = 30_u64 * 1_000_000_000_u64;        // 30 SOL in lamports
