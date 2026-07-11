@@ -1,4 +1,5 @@
 [package]
+rust-version = "1.75.0"
 name = "moonflux-curve"
 version = "0.1.0"
 description = "MoonFluxx Custom Bonding Curve Contract"
@@ -19,3 +20,4 @@ default = []
 anchor-lang = "0.30.1"
 anchor-spl = "0.30.1"
 solana-program = "1.18.26"
+
