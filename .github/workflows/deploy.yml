@@ -48,8 +48,10 @@ jobs:
 
           # ── 4. Restore program keypair (fixed address every deploy) ──────────
           mkdir -p target/deploy
-          echo "$PROGRAM_KEYPAIR" | base64 -d > target/deploy/moonflux_curve-keypair.json
-          echo "Program keypair restored, address: $(solana-keygen pubkey target/deploy/moonflux_curve-keypair.json)"
+          printf '%s' "$PROGRAM_KEYPAIR" > target/deploy/moonflux_curve-keypair.json
+          echo ""
+          echo "Program keypair file contents (first 40 chars): $(head -c 40 target/deploy/moonflux_curve-keypair.json)"
+          echo "Program keypair address: $(solana-keygen pubkey target/deploy/moonflux_curve-keypair.json)"
 
           # ── 5. Build ─────────────────────────────────────────────────────────
           cargo build-sbf
