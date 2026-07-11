@@ -33,8 +33,8 @@ jobs:
           rustc --version
           cargo --version
 
-          # ── 2. Install Agave (Solana 2.0) ───────────────────────────────────
-          curl -sSfL https://release.anza.xyz/v2.0.15/install | sh
+          # ── 2. Install Agave stable (ships with Rust 1.85+ internally) ────────
+          curl -sSfL https://release.anza.xyz/stable/install | sh
           export PATH="$HOME/.local/share/solana/install/active_release/bin:$PATH"
           solana --version
 
