@@ -22,18 +22,19 @@ jobs:
 
       - name: Install Rust, Agave, Build & Deploy
         env:
-          DEPLOYER_KEYPAIR: ${{ secrets.DEPLOYER_KEYPAIR }}
+          DEPLOYER_KEYPAIR:  ${{ secrets.DEPLOYER_KEYPAIR }}
+          PROGRAM_KEYPAIR:   ${{ secrets.PROGRAM_KEYPAIR }}
           NETWORK: ${{ inputs.network }}
         run: |
           set -euxo pipefail
 
-          # ── 1. Install Rust via rustup (no marketplace action) ──────────────
+          # ── 1. Install Rust via rustup ───────────────────────────────────────
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
           source "$HOME/.cargo/env"
           rustc --version
           cargo --version
 
-          # ── 2. Install Agave stable (ships with Rust 1.85+ internally) ────────
+          # ── 2. Install Agave stable ──────────────────────────────────────────
           curl -sSfL https://release.anza.xyz/stable/install | sh
           export PATH="$HOME/.local/share/solana/install/active_release/bin:$PATH"
           solana --version
@@ -45,12 +46,17 @@ jobs:
           echo "Deployer: $(solana address)"
           echo "Balance : $(solana balance)"
 
-          # ── 4. Build ─────────────────────────────────────────────────────────
+          # ── 4. Restore program keypair (fixed address every deploy) ──────────
+          mkdir -p target/deploy
+          echo "$PROGRAM_KEYPAIR" > target/deploy/moonflux_curve-keypair.json
+
+          # ── 5. Build ─────────────────────────────────────────────────────────
           cargo build-sbf
 
-          # ── 5. Deploy ────────────────────────────────────────────────────────
+          # ── 6. Deploy (upgrade existing program or create at fixed address) ──
           solana program deploy target/deploy/moonflux_curve.so \
             --keypair /tmp/deployer.json \
+            --program-id target/deploy/moonflux_curve-keypair.json \
             --url "$NETWORK" | tee /tmp/deploy.txt
 
           cat /tmp/deploy.txt
