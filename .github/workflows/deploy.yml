@@ -21,47 +21,42 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Install Rust
+      - name: Install Rust 1.79
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.79.0"
 
-      - name: Install Agave (Solana) 2.0.15
+      - name: Install, Build & Deploy
+        env:
+          DEPLOYER_KEYPAIR: ${{ secrets.DEPLOYER_KEYPAIR }}
+          NETWORK: ${{ inputs.network }}
         run: |
+          set -euo pipefail
+
+          # ── Install Agave / Solana CLI ──────────────────────────────────────
           sh -c "$(curl -sSfL https://release.anza.xyz/v2.0.15/install)"
-          echo "Agave install finished"
-          ls -la /home/runner/.local/share/solana/install/active_release/bin || echo "Bin dir missing"
-          echo "/home/runner/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
-
-      - name: Write deployer keypair
-        run: |
-          export PATH="/home/runner/.local/share/solana/install/active_release/bin:$PATH"
-          which solana || echo "Solana not in path"
+          export PATH="$HOME/.local/share/solana/install/active_release/bin:$PATH"
           solana --version
-          echo '${{ secrets.DEPLOYER_KEYPAIR }}' > /tmp/deployer.json
+
+          # ── Write deployer key ──────────────────────────────────────────────
+          echo "$DEPLOYER_KEYPAIR" > /tmp/deployer.json
           solana config set --keypair /tmp/deployer.json
-          solana config set --url ${{ inputs.network }}
-          solana address
-          solana balance
+          solana config set --url "$NETWORK"
+          echo "Deployer: $(solana address)"
+          echo "Balance : $(solana balance)"
 
-      - name: Build Anchor program
-        run: |
-          export PATH="/home/runner/.local/share/solana/install/active_release/bin:$PATH"
-          cargo build-sbf 2>&1
+          # ── Build ───────────────────────────────────────────────────────────
+          cargo build-sbf
 
-      - name: Deploy to chosen network
-        run: |
-          export PATH="/home/runner/.local/share/solana/install/active_release/bin:$PATH"
-          PROGRAM_SO="target/deploy/moonflux_curve.so"
-          echo "Deploying $PROGRAM_SO to ${{ inputs.network }}..."
-          solana program deploy "$PROGRAM_SO" \
+          # ── Deploy ──────────────────────────────────────────────────────────
+          solana program deploy target/deploy/moonflux_curve.so \
             --keypair /tmp/deployer.json \
-            --url ${{ inputs.network }} > /tmp/deploy_output.txt 2>&1 || (cat /tmp/deploy_output.txt && exit 1)
-          cat /tmp/deploy_output.txt
-          PROGRAM_ID=$(cat /tmp/deploy_output.txt | grep "Program Id:" | awk '{print $3}')
-          echo "✅ DEPLOYED PROGRAM ID: $PROGRAM_ID"
-          echo "program_id=$PROGRAM_ID" >> $GITHUB_OUTPUT
-          
-          echo "### ✅ Deployment Complete" >> $GITHUB_STEP_SUMMARY
-          echo "**Network:** ${{ inputs.network }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Program ID:** \`$PROGRAM_ID\`" >> $GITHUB_STEP_SUMMARY
+            --url "$NETWORK" | tee /tmp/deploy.txt
+
+          cat /tmp/deploy.txt
+          PROGRAM_ID=$(grep -oP "Program Id: \K\S+" /tmp/deploy.txt || echo "see above")
+          echo "✅ Program ID: $PROGRAM_ID"
+
+          echo "### ✅ Deployed!" >> $GITHUB_STEP_SUMMARY
+          echo "Network: $NETWORK" >> $GITHUB_STEP_SUMMARY
+          echo "Program ID: \`$PROGRAM_ID\`" >> $GITHUB_STEP_SUMMARY
