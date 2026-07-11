@@ -250,6 +250,9 @@ pub mod moonflux_curve {
         let config = &ctx.accounts.global_config;
         require!(!config.paused, CurveError::ProgramPaused);
 
+        // Save account_info before mutable borrow of curve
+        let curve_account_info = ctx.accounts.bonding_curve.to_account_info();
+
         let curve = &mut ctx.accounts.bonding_curve;
         require!(!curve.complete, CurveError::CurveComplete);
         require!(amount_in > 0, CurveError::InvalidAmount);
@@ -333,7 +336,7 @@ pub mod moonflux_curve {
                 Transfer {
                     from:      ctx.accounts.curve_token_account.to_account_info(),
                     to:        ctx.accounts.user_token_account.to_account_info(),
-                    authority: ctx.accounts.bonding_curve.to_account_info(),
+                    authority: curve_account_info,
                 },
                 signer,
             ),
