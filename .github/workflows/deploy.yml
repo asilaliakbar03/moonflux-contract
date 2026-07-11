@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       network:
-        description: 'Network to deploy to'
+        description: 'Network'
         required: true
         default: 'devnet'
         type: choice
@@ -14,49 +14,52 @@ on:
 
 jobs:
   build-and-deploy:
-    name: Build & Deploy
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust 1.79
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.79.0"
-
-      - name: Install, Build & Deploy
+      - name: Install Rust, Agave, Build & Deploy
         env:
           DEPLOYER_KEYPAIR: ${{ secrets.DEPLOYER_KEYPAIR }}
           NETWORK: ${{ inputs.network }}
         run: |
-          set -euo pipefail
+          set -euxo pipefail
 
-          # ── Install Agave / Solana CLI ──────────────────────────────────────
-          sh -c "$(curl -sSfL https://release.anza.xyz/v2.0.15/install)"
+          # ── 1. Install Rust via rustup (no marketplace action) ──────────────
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.79.0
+          source "$HOME/.cargo/env"
+          rustc --version
+          cargo --version
+
+          # ── 2. Install Agave (Solana 2.0) ───────────────────────────────────
+          curl -sSfL https://release.anza.xyz/v2.0.15/install | sh
           export PATH="$HOME/.local/share/solana/install/active_release/bin:$PATH"
           solana --version
 
-          # ── Write deployer key ──────────────────────────────────────────────
+          # ── 3. Configure deployer wallet ─────────────────────────────────────
           echo "$DEPLOYER_KEYPAIR" > /tmp/deployer.json
           solana config set --keypair /tmp/deployer.json
           solana config set --url "$NETWORK"
           echo "Deployer: $(solana address)"
           echo "Balance : $(solana balance)"
 
-          # ── Build ───────────────────────────────────────────────────────────
+          # ── 4. Build ─────────────────────────────────────────────────────────
           cargo build-sbf
 
-          # ── Deploy ──────────────────────────────────────────────────────────
+          # ── 5. Deploy ────────────────────────────────────────────────────────
           solana program deploy target/deploy/moonflux_curve.so \
             --keypair /tmp/deployer.json \
             --url "$NETWORK" | tee /tmp/deploy.txt
 
           cat /tmp/deploy.txt
-          PROGRAM_ID=$(grep -oP "Program Id: \K\S+" /tmp/deploy.txt || echo "see above")
-          echo "✅ Program ID: $PROGRAM_ID"
+          PROGRAM_ID=$(grep -oP "Program Id: \K\S+" /tmp/deploy.txt || echo "check_logs")
+          echo ""
+          echo "========================================"
+          echo "  ✅  PROGRAM ID: $PROGRAM_ID"
+          echo "========================================"
 
-          echo "### ✅ Deployed!" >> $GITHUB_STEP_SUMMARY
-          echo "Network: $NETWORK" >> $GITHUB_STEP_SUMMARY
-          echo "Program ID: \`$PROGRAM_ID\`" >> $GITHUB_STEP_SUMMARY
+          echo "### ✅ Deployment Complete" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Network:** $NETWORK" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Program ID:** \`$PROGRAM_ID\`" >> "$GITHUB_STEP_SUMMARY"
