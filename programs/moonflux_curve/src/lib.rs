@@ -2,9 +2,13 @@ use anchor_lang::prelude::*;
 use anchor_spl::{
     associated_token::AssociatedToken,
     token::{
-        self, Mint, Token, TokenAccount, MintTo, Transfer,
+        self, Mint, Token, TokenAccount, MintTo, Transfer, Burn,
         SetAuthority, spl_token::instruction::AuthorityType,
     },
+};
+use solana_program::{
+    instruction::{AccountMeta, Instruction},
+    program::invoke_signed,
 };
 
 declare_id!("DrVK92avUZvKHbyxd3StwX9c3zkZf5nDNoBrgU32e1NE");
@@ -17,6 +21,20 @@ pub const TARGET_SOL_DEFAULT: u64    = 85_u64 * 1_000_000_000_u64;         // 85
 pub const TARGET_USDC_DEFAULT: u64   = 69_000_u64 * 1_000_000_u64;         // $69,000 graduation target (USDC/USDT, 6 decimals)
 pub const FEE_BPS_DEFAULT: u64       = 100_u64;                             // 1.00% default fee
 pub const METADATA_URI_MAX_LEN: usize = 200;                                // Max on-chain metadata URI length
+pub const ESCROW_TIMEOUT: i64 = 72 * 60 * 60;                                // 72 hours in seconds
+
+// ── RAYDIUM CPMM CONSTANTS ───────────────────────────────────────────────────
+pub const RAYDIUM_CPMM_DEVNET: &str = "DRaycpLY18LhpbydsBWbVJtxpNv9oXPgjRSfpF2bWpYb";
+pub const RAYDIUM_CREATE_POOL_FEE_DEVNET: &str = "3oE58BKVt8KuYkGxx8zBojugnymWmBiyafWgMrnb6eYy";
+pub const RAYDIUM_INITIALIZE_DISCRIMINATOR: [u8; 8] = [175, 175, 109, 31, 13, 152, 155, 237];
+
+// ── ESCROW STATUS ────────────────────────────────────────────────────────────
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq)]
+pub enum EscrowStatus {
+    Pending    = 0, // Funds locked, waiting for pool creation
+    PoolCreated = 1, // Raydium pool was created successfully
+    Refunded   = 2, // Timeout expired, funds returned to creator
+}
 
 // ── ACCOUNT SIZES ─────────────────────────────────────────────────────────────
 // GlobalConfig: extended with usdc_mint + usdt_mint (two extra Pubkeys = 64 bytes)
@@ -46,6 +64,16 @@ pub const CURVE_ACCOUNT_SIZE: usize = 8    // discriminator
                                     + 4 + METADATA_URI_MAX_LEN // metadata_uri (Vec<u8> prefix + bytes)
                                     + 8    // creator_fee_bps  (future rev-share)
                                     + 32;  // migration_wallet (future)
+
+// MigrationEscrow: holds graduated funds until Raydium pool creation or refund
+pub const ESCROW_ACCOUNT_SIZE: usize = 8    // discriminator
+                                     + 32   // mint
+                                     + 32   // creator (token creator, receives refund)
+                                     + 8    // sol_amount (lamports escrowed)
+                                     + 8    // token_amount (tokens escrowed)
+                                     + 8    // created_at (unix timestamp)
+                                     + 8    // timeout (seconds, default 72h)
+                                     + 1;   // status (EscrowStatus enum)
 
 // ── QUOTE TYPE ────────────────────────────────────────────────────────────────
 /// Determines what token the user pays/receives when buying/selling on the curve.
@@ -447,8 +475,9 @@ pub mod moonflux_curve {
     }
 
     // ── migrate ──────────────────────────────────────────────────────────────
-    /// Called by admin bot after graduation. Sends SOL + remaining tokens
-    /// to the migration wallet for Raydium LP seeding.
+    /// Called by admin after graduation. Sends SOL + remaining tokens
+    /// to a PROGRAM-CONTROLLED ESCROW PDA (not an admin wallet).
+    /// The escrow holds funds until Raydium pool creation or 72h refund.
     pub fn migrate(ctx: Context<Migrate>) -> Result<()> {
         let curve = &ctx.accounts.bonding_curve;
         require!(curve.complete, CurveError::CurveNotComplete);
@@ -457,6 +486,7 @@ pub mod moonflux_curve {
         let token_balance = ctx.accounts.curve_token_account.amount;
         let mint_key      = ctx.accounts.mint.key();
 
+        // Transfer SOL from sol_vault → escrow_sol_vault
         if sol_balance > 0 {
             let vault_seeds: &[&[u8]] = &[
                 b"sol_vault",
@@ -468,7 +498,7 @@ pub mod moonflux_curve {
                     ctx.accounts.system_program.to_account_info(),
                     anchor_lang::system_program::Transfer {
                         from: ctx.accounts.sol_vault.to_account_info(),
-                        to:   ctx.accounts.migration_wallet.to_account_info(),
+                        to:   ctx.accounts.escrow_sol_vault.to_account_info(),
                     },
                     &[vault_seeds],
                 ),
@@ -476,6 +506,7 @@ pub mod moonflux_curve {
             )?;
         }
 
+        // Transfer tokens from curve_token_account → escrow_token_account
         if token_balance > 0 {
             let curve_seeds: &[&[u8]] = &[
                 b"curve",
@@ -487,7 +518,7 @@ pub mod moonflux_curve {
                     ctx.accounts.token_program.to_account_info(),
                     Transfer {
                         from:      ctx.accounts.curve_token_account.to_account_info(),
-                        to:        ctx.accounts.migration_token_account.to_account_info(),
+                        to:        ctx.accounts.escrow_token_account.to_account_info(),
                         authority: ctx.accounts.bonding_curve.to_account_info(),
                     },
                     &[curve_seeds],
@@ -496,9 +527,212 @@ pub mod moonflux_curve {
             )?;
         }
 
+        // Initialize the escrow account
+        let escrow = &mut ctx.accounts.escrow;
+        let clock = Clock::get()?;
+        escrow.mint         = mint_key;
+        escrow.creator      = curve.creator;
+        escrow.sol_amount   = sol_balance;
+        escrow.token_amount = token_balance;
+        escrow.created_at   = clock.unix_timestamp;
+        escrow.timeout      = ESCROW_TIMEOUT;
+        escrow.status       = EscrowStatus::Pending;
+
         msg!(
-            "MIGRATE: {} lamports + {} tokens → migration wallet {}",
-            sol_balance, token_balance, ctx.accounts.migration_wallet.key()
+            "MIGRATE TO ESCROW: {} lamports + {} tokens. Escrow PDA = {}. Refund after {}s.",
+            sol_balance, token_balance, ctx.accounts.escrow.key(), ESCROW_TIMEOUT
+        );
+        Ok(())
+    }
+
+    // ── create_raydium_pool ─────────────────────────────────────────────────
+    /// Called by admin to create Raydium CPMM pool using escrowed funds.
+    /// Transfers SOL + tokens from escrow to admin (as Raydium creator),
+    /// then CPIs into Raydium CPMM to initialize the pool.
+    /// LP tokens are burned immediately to permanently lock liquidity.
+    pub fn create_raydium_pool<'info>(
+        ctx: Context<'_, '_, 'info, 'info, CreateRaydiumPool<'info>>,
+        init_amount_sol: u64,
+        init_amount_token: u64,
+    ) -> Result<()> {
+        let escrow = &mut ctx.accounts.escrow;
+        require!(escrow.status == EscrowStatus::Pending, CurveError::EscrowAlreadyProcessed);
+
+        let mint_key = escrow.mint;
+
+        // Transfer SOL from escrow vault to admin (Raydium needs creator = wallet)
+        let escrow_vault_seeds: &[&[u8]] = &[
+            b"escrow_vault",
+            mint_key.as_ref(),
+            &[ctx.bumps.escrow_sol_vault],
+        ];
+        let escrow_sol_bal = ctx.accounts.escrow_sol_vault.lamports();
+        if escrow_sol_bal > 0 {
+            anchor_lang::system_program::transfer(
+                CpiContext::new_with_signer(
+                    ctx.accounts.system_program.to_account_info(),
+                    anchor_lang::system_program::Transfer {
+                        from: ctx.accounts.escrow_sol_vault.to_account_info(),
+                        to:   ctx.accounts.admin.to_account_info(),
+                    },
+                    &[escrow_vault_seeds],
+                ),
+                escrow_sol_bal,
+            )?;
+        }
+
+        // Transfer tokens from escrow to admin's token account
+        let escrow_seeds: &[&[u8]] = &[
+            b"escrow",
+            mint_key.as_ref(),
+            &[ctx.bumps.escrow],
+        ];
+        let escrow_token_bal = ctx.accounts.escrow_token_account.amount;
+        if escrow_token_bal > 0 {
+            token::transfer(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    Transfer {
+                        from:      ctx.accounts.escrow_token_account.to_account_info(),
+                        to:        ctx.accounts.admin_token_account.to_account_info(),
+                        authority: ctx.accounts.escrow.to_account_info(),
+                    },
+                    &[escrow_seeds],
+                ),
+                escrow_token_bal,
+            )?;
+        }
+
+        // Build Raydium CPMM initialize CPI
+        // The remaining accounts must be passed in this EXACT order:
+        // [0] cp_swap_program, [1] amm_config, [2] authority, [3] pool_state,
+        // [4] token_0_mint, [5] token_1_mint, [6] lp_mint,
+        // [7] creator_token_0, [8] creator_token_1, [9] creator_lp_token,
+        // [10] token_0_vault, [11] token_1_vault, [12] create_pool_fee,
+        // [13] observation_state, [14] token_program, [15] token_0_program,
+        // [16] token_1_program, [17] associated_token_program,
+        // [18] system_program, [19] rent
+        let remaining = ctx.remaining_accounts;
+        require!(remaining.len() >= 20, CurveError::InsufficientRaydiumAccounts);
+
+        let cp_swap_program = &remaining[0];
+
+        let mut data = Vec::with_capacity(32);
+        data.extend_from_slice(&RAYDIUM_INITIALIZE_DISCRIMINATOR);
+        data.extend_from_slice(&init_amount_sol.to_le_bytes());
+        data.extend_from_slice(&init_amount_token.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes()); // open_time = 0 (immediate)
+
+        let accounts = vec![
+            AccountMeta::new(ctx.accounts.admin.key(), true),     // creator
+            AccountMeta::new_readonly(remaining[1].key(), false), // amm_config
+            AccountMeta::new_readonly(remaining[2].key(), false), // authority
+            AccountMeta::new(remaining[3].key(), false),          // pool_state
+            AccountMeta::new_readonly(remaining[4].key(), false), // token_0_mint
+            AccountMeta::new_readonly(remaining[5].key(), false), // token_1_mint
+            AccountMeta::new(remaining[6].key(), false),          // lp_mint
+            AccountMeta::new(remaining[7].key(), false),          // creator_token_0
+            AccountMeta::new(remaining[8].key(), false),          // creator_token_1
+            AccountMeta::new(remaining[9].key(), false),          // creator_lp_token
+            AccountMeta::new(remaining[10].key(), false),         // token_0_vault
+            AccountMeta::new(remaining[11].key(), false),         // token_1_vault
+            AccountMeta::new(remaining[12].key(), false),         // create_pool_fee
+            AccountMeta::new(remaining[13].key(), false),         // observation_state
+            AccountMeta::new_readonly(remaining[14].key(), false), // token_program
+            AccountMeta::new_readonly(remaining[15].key(), false), // token_0_program
+            AccountMeta::new_readonly(remaining[16].key(), false), // token_1_program
+            AccountMeta::new_readonly(remaining[17].key(), false), // associated_token_program
+            AccountMeta::new_readonly(remaining[18].key(), false), // system_program
+            AccountMeta::new_readonly(remaining[19].key(), false), // rent
+        ];
+
+        let ix = Instruction {
+            program_id: cp_swap_program.key(),
+            accounts,
+            data,
+        };
+
+        // Collect all AccountInfos for the CPI
+        let mut account_infos = vec![ctx.accounts.admin.to_account_info()];
+        for i in 1..20 {
+            account_infos.push(remaining[i].to_account_info());
+        }
+
+        // Invoke Raydium — admin is a Signer so no invoke_signed needed
+        solana_program::program::invoke(&ix, &account_infos)?;
+
+        // Mark escrow as complete
+        let escrow = &mut ctx.accounts.escrow;
+        escrow.status = EscrowStatus::PoolCreated;
+
+        msg!("RAYDIUM POOL CREATED for mint {}. Liquidity locked.", mint_key);
+        Ok(())
+    }
+
+    // ── refund_escrow ───────────────────────────────────────────────────────
+    /// Callable by ANYONE after the 72-hour timeout expires.
+    /// Returns SOL to the original token creator. Burns escrowed tokens.
+    /// This is the safety net: if admin doesn't create the pool, users get refunded.
+    pub fn refund_escrow(ctx: Context<RefundEscrow>) -> Result<()> {
+        let escrow = &ctx.accounts.escrow;
+        require!(escrow.status == EscrowStatus::Pending, CurveError::EscrowAlreadyProcessed);
+
+        let clock = Clock::get()?;
+        let deadline = escrow.created_at + escrow.timeout;
+        require!(clock.unix_timestamp >= deadline, CurveError::EscrowTimeoutNotReached);
+
+        let mint_key = escrow.mint;
+
+        // Return SOL from escrow vault to creator
+        let escrow_vault_seeds: &[&[u8]] = &[
+            b"escrow_vault",
+            mint_key.as_ref(),
+            &[ctx.bumps.escrow_sol_vault],
+        ];
+        let sol_balance = ctx.accounts.escrow_sol_vault.lamports();
+        if sol_balance > 0 {
+            anchor_lang::system_program::transfer(
+                CpiContext::new_with_signer(
+                    ctx.accounts.system_program.to_account_info(),
+                    anchor_lang::system_program::Transfer {
+                        from: ctx.accounts.escrow_sol_vault.to_account_info(),
+                        to:   ctx.accounts.creator.to_account_info(),
+                    },
+                    &[escrow_vault_seeds],
+                ),
+                sol_balance,
+            )?;
+        }
+
+        // Burn escrowed tokens (remove from circulation)
+        let escrow_seeds: &[&[u8]] = &[
+            b"escrow",
+            mint_key.as_ref(),
+            &[ctx.bumps.escrow],
+        ];
+        let token_balance = ctx.accounts.escrow_token_account.amount;
+        if token_balance > 0 {
+            token::burn(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    Burn {
+                        mint:      ctx.accounts.mint.to_account_info(),
+                        from:      ctx.accounts.escrow_token_account.to_account_info(),
+                        authority: ctx.accounts.escrow.to_account_info(),
+                    },
+                    &[escrow_seeds],
+                ),
+                token_balance,
+            )?;
+        }
+
+        // Mark as refunded
+        let escrow = &mut ctx.accounts.escrow;
+        escrow.status = EscrowStatus::Refunded;
+
+        msg!(
+            "ESCROW REFUNDED: {} SOL returned to creator {}, {} tokens burned.",
+            sol_balance, ctx.accounts.creator.key(), token_balance
         );
         Ok(())
     }
@@ -674,16 +908,33 @@ pub struct Migrate<'info> {
 
     pub mint: Account<'info, Mint>,
 
-    #[account(mut)]
-    /// CHECK: Admin-controlled migration destination
-    pub migration_wallet: AccountInfo<'info>,
+    /// The escrow PDA that holds funds until pool creation or refund
+    #[account(
+        init,
+        payer = admin,
+        space = ESCROW_ACCOUNT_SIZE,
+        seeds = [b"escrow", mint.key().as_ref()],
+        bump
+    )]
+    pub escrow: Account<'info, MigrationEscrow>,
 
+    /// SOL vault for the escrow (system-owned PDA)
     #[account(
         mut,
-        token::mint = mint,
-        token::authority = migration_wallet,
+        seeds = [b"escrow_vault", mint.key().as_ref()],
+        bump
     )]
-    pub migration_token_account: Account<'info, TokenAccount>,
+    /// CHECK: System-owned PDA to hold escrowed SOL. Seeds verified.
+    pub escrow_sol_vault: UncheckedAccount<'info>,
+
+    /// Token account owned by the escrow PDA
+    #[account(
+        init,
+        payer = admin,
+        associated_token::mint = mint,
+        associated_token::authority = escrow
+    )]
+    pub escrow_token_account: Account<'info, TokenAccount>,
 
     #[account(
         seeds = [b"global"],
@@ -692,7 +943,98 @@ pub struct Migrate<'info> {
     )]
     pub global_config: Account<'info, GlobalConfig>,
 
+    #[account(mut)]
     pub admin: Signer<'info>,
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct CreateRaydiumPool<'info> {
+    #[account(
+        mut,
+        seeds = [b"escrow", escrow.mint.as_ref()],
+        bump,
+    )]
+    pub escrow: Account<'info, MigrationEscrow>,
+
+    #[account(
+        mut,
+        seeds = [b"escrow_vault", escrow.mint.as_ref()],
+        bump
+    )]
+    /// CHECK: Escrow SOL vault PDA. Seeds verified.
+    pub escrow_sol_vault: UncheckedAccount<'info>,
+
+    #[account(
+        mut,
+        associated_token::mint = mint,
+        associated_token::authority = escrow
+    )]
+    pub escrow_token_account: Account<'info, TokenAccount>,
+
+    pub mint: Account<'info, Mint>,
+
+    /// Admin's token account to temporarily receive tokens before Raydium CPI
+    #[account(
+        mut,
+        token::mint = mint,
+        token::authority = admin,
+    )]
+    pub admin_token_account: Account<'info, TokenAccount>,
+
+    #[account(
+        seeds = [b"global"],
+        bump,
+        has_one = admin @ CurveError::Unauthorized,
+    )]
+    pub global_config: Account<'info, GlobalConfig>,
+
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+    // Remaining accounts: 20 Raydium CPMM accounts (passed via ctx.remaining_accounts)
+}
+
+#[derive(Accounts)]
+pub struct RefundEscrow<'info> {
+    #[account(
+        mut,
+        seeds = [b"escrow", escrow.mint.as_ref()],
+        bump,
+    )]
+    pub escrow: Account<'info, MigrationEscrow>,
+
+    #[account(
+        mut,
+        seeds = [b"escrow_vault", escrow.mint.as_ref()],
+        bump
+    )]
+    /// CHECK: Escrow SOL vault PDA. Seeds verified.
+    pub escrow_sol_vault: UncheckedAccount<'info>,
+
+    #[account(
+        mut,
+        associated_token::mint = mint,
+        associated_token::authority = escrow
+    )]
+    pub escrow_token_account: Account<'info, TokenAccount>,
+
+    #[account(mut)]
+    pub mint: Account<'info, Mint>,
+
+    /// The original token creator who receives the refunded SOL
+    #[account(
+        mut,
+        address = escrow.creator @ CurveError::Unauthorized,
+    )]
+    /// CHECK: Must match escrow.creator. Receives refunded SOL.
+    pub creator: AccountInfo<'info>,
+
+    /// Anyone can call this (no admin required), just need to pass the right accounts
+    pub caller: Signer<'info>,
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
 }
@@ -735,6 +1077,17 @@ pub struct BondingCurve {
     pub metadata_uri:          String,    // 4 + up to 200 bytes
 }
 
+#[account]
+pub struct MigrationEscrow {
+    pub mint:         Pubkey,       // 32 — the token this escrow is for
+    pub creator:      Pubkey,       // 32 — original token creator (receives refund)
+    pub sol_amount:   u64,          // 8  — SOL deposited into escrow
+    pub token_amount: u64,          // 8  — tokens deposited into escrow
+    pub created_at:   i64,          // 8  — unix timestamp of escrow creation
+    pub timeout:      i64,          // 8  — seconds until refund allowed (72h = 259200)
+    pub status:       EscrowStatus, // 1  — Pending / PoolCreated / Refunded
+}
+
 // ── ERROR CODES ───────────────────────────────────────────────────────────────
 #[error_code]
 pub enum CurveError {
@@ -768,4 +1121,10 @@ pub enum CurveError {
     UnsupportedQuoteType,
     #[msg("Metadata URI exceeds maximum length of 200 characters.")]
     MetadataUriTooLong,
+    #[msg("Escrow has already been processed (pool created or refunded).")]
+    EscrowAlreadyProcessed,
+    #[msg("Escrow timeout has not been reached yet. Wait for the 72-hour window.")]
+    EscrowTimeoutNotReached,
+    #[msg("Not enough Raydium accounts provided. Expected 20 remaining accounts.")]
+    InsufficientRaydiumAccounts,
 }

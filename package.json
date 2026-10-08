@@ -1,0 +1,26 @@
+{
+  "name": "moonflux-contract",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/asilaliakbar03/moonflux-contract.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/asilaliakbar03/moonflux-contract/issues"
+  },
+  "homepage": "https://github.com/asilaliakbar03/moonflux-contract#readme",
+  "dependencies": {
+    "@coral-xyz/anchor": "^0.32.1",
+    "@solana/web3.js": "^1.98.4",
+    "bn.js": "^5.2.5"
+  }
+}

@@ -15,6 +15,13 @@ on:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+    # Only the founder may run deploys. Anyone with Write access can start a
+    # workflow_dispatch, so this guard is required once the team has access.
+    if: github.actor == 'asilaliakbar03'
+    # Create GitHub Environments named "devnet" and "mainnet-beta"
+    # (Settings → Environments) with "Required reviewers" = founder,
+    # and store DEPLOYER_KEYPAIR / PROGRAM_KEYPAIR as environment secrets.
+    environment: ${{ inputs.network }}
 
     steps:
       - name: Checkout
@@ -26,7 +33,8 @@ jobs:
           PROGRAM_KEYPAIR:   ${{ secrets.PROGRAM_KEYPAIR }}
           NETWORK: ${{ inputs.network }}
         run: |
-          set -euxo pipefail
+          # NOTE: no "-x" — command tracing would print secret values to the log
+          set -euo pipefail
 
           # ── 1. Install Rust via rustup ───────────────────────────────────────
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
@@ -50,7 +58,6 @@ jobs:
           mkdir -p target/deploy
           printf '%s' "$PROGRAM_KEYPAIR" > target/deploy/moonflux_curve-keypair.json
           echo ""
-          echo "Program keypair file contents (first 40 chars): $(head -c 40 target/deploy/moonflux_curve-keypair.json)"
           echo "Program keypair address: $(solana-keygen pubkey target/deploy/moonflux_curve-keypair.json)"
 
           # ── 5. Build ─────────────────────────────────────────────────────────

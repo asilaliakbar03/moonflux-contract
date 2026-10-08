@@ -1,0 +1,8 @@
+# Code owners are automatically requested for review on matching PRs.
+# TODO after moving to the GitHub organization: add the Tech Lead,
+# e.g.  /programs/  @asilaliakbar03 @TECH_LEAD_USERNAME
+
+*               @asilaliakbar03
+/programs/      @asilaliakbar03
+/.github/       @asilaliakbar03
+Cargo.lock      @asilaliakbar03

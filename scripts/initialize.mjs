@@ -14,7 +14,7 @@ import { dirname, join } from 'path';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // ── Config ──────────────────────────────────────────────────────────────────
-const PROGRAM_ID  = new PublicKey('8vkiPVrCriVX2YPtmEPLh37odLCdEiT49VBgyrXkqKbS');
+const PROGRAM_ID  = new PublicKey('DrVK92avUZvKHbyxd3StwX9c3zkZf5nDNoBrgU32e1NE');
 const RPC_URL     = 'https://api.devnet.solana.com';
 const WALLET_PATH = join(__dirname, '..', 'wallet.json');
 
