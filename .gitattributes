@@ -1,0 +1,5 @@
+# Shell scripts must keep LF line endings or bash (WSL/Linux) fails with $'\r' errors
+*.sh   text eol=lf
+*.rs   text eol=lf
+*.toml text eol=lf
+*.yml  text eol=lf
